@@ -25,6 +25,8 @@ spec:
                   type: string
                 cpu:
                   type: string
+                gpu:
+                  type: string
                 checkpointPath:
                   type: string
                 queueName:

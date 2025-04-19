@@ -84,7 +84,7 @@ func (r *MLJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
             return ctrl.Result{}, err
         }
         logger.Info("새 Workload 생성 완료", "Workload", newWL.Name)
-	return ctrl.Result{}, nil
+        return ctrl.Result{}, nil
     }
 
     // 3‑1b. MLJob.Spec.CPU 변경 감지
@@ -94,12 +94,28 @@ func (r *MLJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
     if existingCPU.Cmp(desiredCPU) != 0 {
         logger.Info("MLJob CPU 변경 감지, 기존 Workload 삭제",
             "from", existingCPU.String(), "to", desiredCPU.String())
-        // Workload 삭제 (cascade deletes Pod via OwnerReference)
         if err := r.Delete(ctx, &workload, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
             logger.Error(err, "기존 Workload 삭제 실패")
             return ctrl.Result{}, err
         }
-        // 재생성 위해 바로 재큐
+        return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+    }
+
+    // 3‑1c. MLJob.Spec.GPU 변경 감지
+    existingGPU := workload.Spec.PodSets[0].Template.Spec.Containers[0].
+        Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
+    // 빈 문자열이나 "0"일 때는 0 GPU
+    var desiredGPU resource.Quantity
+    if mljob.Spec.GPU != "" {
+        desiredGPU = resource.MustParse(mljob.Spec.GPU)
+    }
+    if existingGPU.Cmp(desiredGPU) != 0 {
+        logger.Info("MLJob GPU 변경 감지, 기존 Workload 삭제",
+            "from", existingGPU.String(), "to", desiredGPU.String())
+        if err := r.Delete(ctx, &workload, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
+            logger.Error(err, "기존 Workload 삭제 실패")
+            return ctrl.Result{}, err
+        }
         return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
     }
 
@@ -153,6 +169,13 @@ func (r *MLJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 
 func buildWorkloadFromMLJob(job *ai.MLJob, workloadName string) *kueuev1beta1.Workload {
+    // CPU가 비어 있으면 "1"로 기본값 대체
+    cpuStr := job.Spec.CPU
+    if cpuStr == "" {
+        cpuStr = "1"
+    }
+    cpuQty := resource.MustParse(cpuStr)
+
     return &kueuev1beta1.Workload{
         ObjectMeta: metav1.ObjectMeta{
             Name:      workloadName,
@@ -171,10 +194,10 @@ func buildWorkloadFromMLJob(job *ai.MLJob, workloadName string) *kueuev1beta1.Wo
                             Args:  []string{"--resume-from=" + job.Spec.CheckpointPath},
                             Resources: corev1.ResourceRequirements{
                                 Requests: corev1.ResourceList{
-                                    corev1.ResourceCPU: resource.MustParse(job.Spec.CPU),
+                                    corev1.ResourceCPU: cpuQty,
                                 },
                                 Limits: corev1.ResourceList{
-                                    corev1.ResourceCPU: resource.MustParse(job.Spec.CPU),
+                                    corev1.ResourceCPU: cpuQty,
                                 },
                             },
                             VolumeMounts: []corev1.VolumeMount{{

@@ -10,6 +10,7 @@ import (
 type MLJobSpec struct {
 	Image          string `json:"image"`
 	CPU            string `json:"cpu"`
+	GPU	       string `json:"gpu,omitempty"`
 	CheckpointPath string `json:"checkpointPath"`
 	QueueName      string `json:"queueName"`
 }
@@ -18,7 +19,7 @@ type MLJobSpec struct {
 type MLJob struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-
+	
 	Spec MLJobSpec `json:"spec,omitempty"`
 }
 
