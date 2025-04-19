@@ -1,0 +1,11 @@
+apiVersion: ai.mljob-controller/v1
+kind: MLJob
+metadata:
+  name: mljob-train-sumin
+  namespace: sumin
+spec:
+  image: itoodo12/train:v5
+  cpu: "2"   
+  checkpointPath: /mnt/data/checkpoints/latest.pt
+  queueName: training-queue
+

@@ -1,0 +1,61 @@
+# 기존 mljob-role 정의
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mljob-role
+  namespace: sumin
+rules:
+  - apiGroups: ["ai.mljob-controller"]
+    resources: ["mljobs"]
+    verbs: ["get","list","watch","create","update","patch","delete"]
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["workloads"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get","list","watch","create","delete"]
+
+# pod-delete-role 정의 (중복 가능)
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-delete-role
+  namespace: sumin
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+
+# mljob-role 을 mljob-controller-sa 에 바인딩
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mljob-rolebinding
+  namespace: sumin
+subjects:
+  - kind: ServiceAccount
+    name: mljob-controller-sa
+    namespace: sumin
+roleRef:
+  kind: Role
+  name: mljob-role
+  apiGroup: rbac.authorization.k8s.io
+
+# pod-delete-role 을 mljob-controller-sa 에 바인딩
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-delete-binding
+  namespace: sumin
+subjects:
+  - kind: ServiceAccount
+    name: mljob-controller-sa
+    namespace: sumin
+roleRef:
+  kind: Role
+  name: pod-delete-role
+  apiGroup: rbac.authorization.k8s.io
+

@@ -1,0 +1,14 @@
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: training-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu"]
+      flavors:
+        - name: default
+          resources:
+            - name: cpu
+              nominalQuota: 20
+
