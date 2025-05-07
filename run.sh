@@ -15,6 +15,3 @@ kubectl apply -f checkpoint-pv.yaml
 
 # ClusterQueue
 kubectl apply -f clusterqueue.yaml
-
-# MLJob 실행
-kubectl apply -f mljob.yaml

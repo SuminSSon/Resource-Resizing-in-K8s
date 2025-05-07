@@ -1,0 +1,12 @@
+apiVersion: ai.mljob-controller/v1
+kind: MLJob
+metadata:
+  name: resize-demo
+  namespace: sumin
+spec:
+  image: itoodo12/train_standby:version15
+  cpu: "5"
+  gpu: "0"
+  checkpointPath: "/mnt/data/checkpoints"
+  queueName: training-queue
+

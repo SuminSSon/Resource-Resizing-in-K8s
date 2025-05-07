@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: standby-controller
+  namespace: sumin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: standby-controller
+  template:
+    metadata:
+      labels:
+        app: standby-controller
+    spec:
+      serviceAccountName: mljob-controller-sa 
+      containers:
+      - name: standby-controller
+        image: itoodo12/standby-controller:new4
+        imagePullPolicy: IfNotPresent
+        args:
+        - --metrics-addr=:8080
+        - --leader-election=false
+        # If your binary is named 'manager', set command:
+        # command: ["/manager"]
+        ports:
+        - containerPort: 8080  # metrics or health probe port if used

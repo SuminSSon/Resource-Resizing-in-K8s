@@ -5,7 +5,8 @@ metadata:
   namespace: sumin
 spec:
   image: itoodo12/train:v5
-  cpu: "2"   
-  checkpointPath: /mnt/data/checkpoints/latest.pt
+  cpu: "5"
+  checkpointPVC: checkpoint-pvc
+  checkpointPath: /mnt/data/checkpoints
   queueName: training-queue
 

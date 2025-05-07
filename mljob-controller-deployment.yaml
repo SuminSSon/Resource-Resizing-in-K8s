@@ -5,10 +5,13 @@ metadata:
   namespace: sumin
 spec:
   replicas: 1
+  selector:                         
+    matchLabels:
+      app: mljob-controller
   template:
     metadata:
       labels:
-        app: mljob-controller
+        app: mljob-controller       
     spec:
       serviceAccountName: mljob-controller-sa
       containers:

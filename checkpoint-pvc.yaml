@@ -1,3 +1,4 @@
+# checkpoint-pvc.yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -5,7 +6,8 @@ metadata:
   namespace: sumin
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
+  volumeName: checkpoint-pv
   resources:
     requests:
       storage: 1Gi

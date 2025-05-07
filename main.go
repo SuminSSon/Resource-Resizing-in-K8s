@@ -1,256 +1,374 @@
 package main
 
 import (
-    "context"
-    "time"
-    "fmt"
+	"context"
+	"fmt"
+	"time"
 
-    ai "mljob-controller/api/v1"
-    kueuev1beta1 "sigs.k8s.io/kueue/apis/kueue/v1beta1"
+	ai "mljob-controller/api/v1"
+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 
-    corev1 "k8s.io/api/core/v1"
-    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    "k8s.io/apimachinery/pkg/api/resource"
-    "k8s.io/apimachinery/pkg/types"
-    "k8s.io/apimachinery/pkg/runtime"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
 
-    "sigs.k8s.io/controller-runtime/pkg/client"
-    ctrl "sigs.k8s.io/controller-runtime"
-    "sigs.k8s.io/controller-runtime/pkg/log"
-    ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
+
+const (
+	roleLabel   = "role"
+	workLabel   = "workload"
+	mljobLabel  = "mljob"
+	roleActive  = "active"
+	roleStandby = "standby"
+
+	finalizer = "mljob.ai.mylab/cleanup"
+)
+
+// --------------------------------------------------
+// Reconciler struct
+// --------------------------------------------------
 
 type MLJobReconciler struct {
 	client.Client
+	Scheme *runtime.Scheme
+	Config *rest.Config
 }
 
-func getUniquePodName(workloadName string) string {
-	return fmt.Sprintf("%s-pod-%d", workloadName, time.Now().UnixNano())
+// --------------------------------------------------
+// Helpers
+// --------------------------------------------------
+
+func isAdmitted(wl *kueue.Workload) bool {
+	if wl.Status.Admission == nil || len(wl.Status.Admission.PodSetAssignments) == 0 {
+		return false
+	}
+	return true
 }
 
-func isAdmitted(wl *kueuev1beta1.Workload) bool {
-    if wl.Status.Admission == nil {
-        return false
-    }
-    if len(wl.Status.Admission.PodSetAssignments) == 0 {
-        return false
-    }
-    for _, assign := range wl.Status.Admission.PodSetAssignments {
-        for _, ps := range wl.Spec.PodSets {
-            if ps.Name == assign.Name && int(*assign.Count) == int(ps.Count) {
-                return true
-            }
-        }
-    }
-    return false
-}
+func buildWorkload(job *ai.MLJob, name, role string) *kueue.Workload {
+	cpu := job.Spec.CPU
+	if cpu == "" {
+		cpu = "1"
+	}
+	cpuQty := resource.MustParse(cpu)
 
-func buildPodFromWorkload(wl *kueuev1beta1.Workload) *corev1.Pod {
-	return &corev1.Pod{
+	pvc := job.Spec.CheckpointPVC
+	if pvc == "" {
+		pvc = "checkpoint-pvc"
+	}
+
+	req := corev1.ResourceList{corev1.ResourceCPU: cpuQty}
+
+	return &kueue.Workload{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      wl.Name + "-pod",
-			Namespace: wl.Namespace,
+			Name:      name,
+			Namespace: job.Namespace,
 			Labels: map[string]string{
-				"workload": wl.Name,
+				roleLabel:  role,
+				workLabel:  name,
+				mljobLabel: job.Name,
+			},
+		},
+		Spec: kueue.WorkloadSpec{
+			QueueName: job.Spec.QueueName,
+			PodSets: []kueue.PodSet{{
+				Name:  "train",
+				Count: 1,
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							roleLabel:  role,
+							workLabel:  name,
+							mljobLabel: job.Name,
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:  "trainer",
+							Image: job.Spec.Image,
+							Resources: corev1.ResourceRequirements{
+								Requests: req,
+								Limits:   req,
+							},
+							VolumeMounts: []corev1.VolumeMount{{
+								Name:      "ckpt",
+								MountPath: job.Spec.CheckpointPath, // "/mnt/data/checkpoints"
+							}},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "ckpt",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvc,
+								},
+							},
+						}},
+					},
+				},
+			}},
+		},
+	}
+}
+
+func (r *MLJobReconciler) sendSIGUSR1(ctx context.Context, ns, pod string) {
+	cmd := []string{"kill", "-SIGUSR1", "1"}
+	restcli := kubernetes.NewForConfigOrDie(r.Config).CoreV1().RESTClient()
+	req := restcli.Post().
+		Namespace(ns).Resource("pods").Name(pod).SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command:   cmd,
+			Container: "trainer",
+		}, clientgoscheme.ParameterCodec)
+	exec, err := remotecommand.NewSPDYExecutor(r.Config, "POST", req.URL())
+	if err == nil {
+		_ = exec.Stream(remotecommand.StreamOptions{})
+	}
+}
+
+func (r *MLJobReconciler) ensurePod(ctx context.Context, wl *kueue.Workload) error {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(wl.Namespace),
+		client.MatchingLabels{workLabel: wl.Name},
+	); err != nil {
+		return err
+	}
+	if len(pods.Items) > 0 {
+		return nil
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: wl.Name + "-pod-",
+			Namespace:    wl.Namespace,
+			Labels:       wl.Labels,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(wl, kueue.SchemeGroupVersion.WithKind("Workload")),
 			},
 		},
 		Spec: *wl.Spec.PodSets[0].Template.Spec.DeepCopy(),
 	}
+	return r.Create(ctx, pod)
 }
+
+func (r *MLJobReconciler) deleteWLandPods(ctx context.Context, wl *kueue.Workload) {
+	prop := metav1.DeletePropagationBackground
+	_ = r.Delete(ctx, wl, client.PropagationPolicy(prop))
+
+	var pods corev1.PodList
+	_ = r.List(ctx, &pods,
+		client.InNamespace(wl.Namespace),
+		client.MatchingLabels{workLabel: wl.Name},
+	)
+	for _, p := range pods.Items {
+		_ = r.Delete(ctx, &p, client.PropagationPolicy(prop))
+	}
+}
+
+// --------------------------------------------------
+// Reconcile
+// --------------------------------------------------
 
 func (r *MLJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    logger := log.FromContext(ctx)
+	log := ctrl.LoggerFrom(ctx)
 
-    // 1. MLJob 가져오기
-    var mljob ai.MLJob
-    if err := r.Get(ctx, req.NamespacedName, &mljob); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)
-    }
+	// 1) Load MLJob
+	var job ai.MLJob
+	if err := r.Get(ctx, req.NamespacedName, &job); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
-    // 2. 고정된 Workload 이름
-    workloadName := "mljob-" + mljob.Name
+	// 2) Finalizer check for cleanup
+	if job.ObjectMeta.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(&job, finalizer) {
+			controllerutil.AddFinalizer(&job, finalizer)
+			_ = r.Update(ctx, &job)
+		}
+	} else {
+		// deleting, cleanup Workloads and Pods
+		var wls kueue.WorkloadList
+		_ = r.List(ctx, &wls,
+			client.InNamespace(job.Namespace),
+			client.MatchingLabels{mljobLabel: job.Name},
+		)
+		for i := range wls.Items {
+			r.deleteWLandPods(ctx, &wls.Items[i])
+		}
+		controllerutil.RemoveFinalizer(&job, finalizer)
+		_ = r.Update(ctx, &job)
+		return ctrl.Result{}, nil
+	}
 
-    // 3. 해당 Workload 조회
-    var workload kueuev1beta1.Workload
-    err := r.Get(ctx, types.NamespacedName{Name: workloadName, Namespace: mljob.Namespace}, &workload)
-    if err != nil {
-        // 3‑1. Workload가 없으면 생성
-        newWL := buildWorkloadFromMLJob(&mljob, workloadName)
-        newWL.OwnerReferences = []metav1.OwnerReference{
-            *metav1.NewControllerRef(&mljob, ai.SchemeGroupVersion.WithKind("MLJob")),
-        }
-        if err := r.Create(ctx, newWL); err != nil {
-            logger.Error(err, "Workload 생성 실패")
-            return ctrl.Result{}, err
-        }
-        logger.Info("새 Workload 생성 완료", "Workload", newWL.Name)
-        return ctrl.Result{}, nil
-    }
+	// 3) Fetch current Workloads
+	var wlList kueue.WorkloadList
+	if err := r.List(ctx, &wlList,
+		client.InNamespace(job.Namespace),
+		client.MatchingLabels{mljobLabel: job.Name},
+	); err != nil {
+		return ctrl.Result{}, err
+	}
 
-    // 3‑1b. MLJob.Spec.CPU 변경 감지
-    existingCPU := workload.Spec.PodSets[0].Template.Spec.Containers[0].
-        Resources.Limits[corev1.ResourceCPU]
-    desiredCPU := resource.MustParse(mljob.Spec.CPU)
-    if existingCPU.Cmp(desiredCPU) != 0 {
-        logger.Info("MLJob CPU 변경 감지, 기존 Workload 삭제",
-            "from", existingCPU.String(), "to", desiredCPU.String())
-        if err := r.Delete(ctx, &workload, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
-            logger.Error(err, "기존 Workload 삭제 실패")
-            return ctrl.Result{}, err
-        }
-        return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-    }
+	var activeWL, standbyWL *kueue.Workload
+	for i := range wlList.Items {
+		w := &wlList.Items[i]
+		switch w.Labels[roleLabel] {
+		case roleActive:
+			activeWL = w
+		case roleStandby:
+			standbyWL = w
+		}
+	}
 
-    // 3‑1c. MLJob.Spec.GPU 변경 감지
-    existingGPU := workload.Spec.PodSets[0].Template.Spec.Containers[0].
-        Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
-    // 빈 문자열이나 "0"일 때는 0 GPU
-    var desiredGPU resource.Quantity
-    if mljob.Spec.GPU != "" {
-        desiredGPU = resource.MustParse(mljob.Spec.GPU)
-    }
-    if existingGPU.Cmp(desiredGPU) != 0 {
-        logger.Info("MLJob GPU 변경 감지, 기존 Workload 삭제",
-            "from", existingGPU.String(), "to", desiredGPU.String())
-        if err := r.Delete(ctx, &workload, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
-            logger.Error(err, "기존 Workload 삭제 실패")
-            return ctrl.Result{}, err
-        }
-        return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-    }
+	activeName := fmt.Sprintf("mljob-%s-active", job.Name)
 
-    // 4. Workload가 Admitted 되었는지 확인
-    if isAdmitted(&workload) {
-        // 4‑1. 매칭되는 Pod 목록 조회
-        pods := &corev1.PodList{}
-        if err := r.List(ctx, pods,
-            client.InNamespace(mljob.Namespace),
-            client.MatchingLabels{"workload": workload.Name},
-        ); err != nil {
-            return ctrl.Result{}, err
-        }
+	// 4) Create Active Workload if not exists
+	if activeWL == nil {
+		wl := buildWorkload(&job, activeName, roleActive)
+		wl.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(&job, ai.SchemeGroupVersion.WithKind("MLJob"))}
+		if err := r.Create(ctx, wl); err != nil && !apierrors.IsAlreadyExists(err) {
+			return ctrl.Result{}, err
+		}
+		log.Info("Active Workload created", "name", activeName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 
-        // 4‑2. Pod가 없으면(또는 generation mismatch) 재생성 플래그
-        recreate := false
-        if len(pods.Items) == 0 {
-            recreate = true
-        } else {
-            for _, pod := range pods.Items {
-                if pod.Labels["workload-gen"] != fmt.Sprint(workload.Generation) {
-                    if err := r.Delete(ctx, &pod, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
-                        logger.Error(err, "기존 Pod 삭제 실패", "Pod", pod.Name)
-                        return ctrl.Result{}, err
-                    }
-                    logger.Info("기존 Pod 삭제 완료", "Pod", pod.Name)
-                    recreate = true
-                }
-            }
-        }
+	// 5) Check if Active is admitted and wait
+	if !isAdmitted(activeWL) {
+		log.Info("Waiting Active admission", "name", activeWL.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 
-        // 4‑3. 필요시 새 Pod 생성
-        if recreate {
-            podName := fmt.Sprintf("%s-pod-%d", workload.Name, time.Now().UnixNano())
-            newPod := buildPodFromWorkload(&workload)
-            newPod.Name = podName
-            newPod.Labels["workload"] = workload.Name
-            newPod.Labels["workload-gen"] = fmt.Sprint(workload.Generation)
-            newPod.OwnerReferences = []metav1.OwnerReference{
-                *metav1.NewControllerRef(&workload, kueuev1beta1.SchemeGroupVersion.WithKind("Workload")),
-            }
-            if err := r.Create(ctx, newPod); err != nil {
-                logger.Error(err, "새 Pod 생성 실패", "Pod", podName)
-                return ctrl.Result{}, err
-            }
-            logger.Info("새 Pod 생성 완료", "Pod", newPod.Name)
-        }
-    }
-    return ctrl.Result{}, nil
+	// Ensure the active pod is created
+	if err := r.ensurePod(ctx, activeWL); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 6) Handle spec change (CPU change handling)
+	needCPU := resource.MustParse("1")
+	if job.Spec.CPU != "" {
+		needCPU = resource.MustParse(job.Spec.CPU)
+	}
+	curCPU := activeWL.Spec.PodSets[0].Template.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU]
+	if curCPU.Cmp(needCPU) == 0 {
+		// nothing changed
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// 7) Create Standby Workload if needed
+	if standbyWL == nil {
+		name := fmt.Sprintf("mljob-%s-upgrade-%d", job.Name, job.Generation)
+		st := buildWorkload(&job, name, roleStandby)
+		st.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(&job, ai.SchemeGroupVersion.WithKind("MLJob"))}
+		if err := r.Create(ctx, st); err != nil && !apierrors.IsAlreadyExists(err) {
+			return ctrl.Result{}, err
+		}
+		log.Info("Standby Workload created", "name", name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// 8) Check if Standby is admitted
+	if !isAdmitted(standbyWL) {
+		log.Info("Waiting Standby admission", "name", standbyWL.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// 9) Ensure standby pod is created
+	if err := r.ensurePod(ctx, standbyWL); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 10) Check if Standby pod is ready, if not, continue waiting
+	var spods corev1.PodList
+	if err := r.List(ctx, &spods,
+		client.InNamespace(job.Namespace),
+		client.MatchingLabels{workLabel: standbyWL.Name},
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+	ready := false
+	for _, p := range spods.Items {
+		for _, c := range p.Status.Conditions {
+			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if ready {
+			break
+		}
+	}
+	if !ready {
+		log.Info("Standby pod not ready yet", "workload", standbyWL.Name)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// 11) Trigger checkpoint on active pods
+	var apods corev1.PodList
+	_ = r.List(ctx, &apods,
+		client.InNamespace(job.Namespace),
+		client.MatchingLabels{workLabel: activeWL.Name},
+	)
+	for _, p := range apods.Items {
+		r.sendSIGUSR1(ctx, job.Namespace, p.Name)
+	}
+
+	// 12) Delete active Workload and Pods
+	time.Sleep(3 * time.Second) // Grace period
+	r.deleteWLandPods(ctx, activeWL)
+
+	// 13) Promote Standby to Active by updating label
+	patch := client.MergeFrom(standbyWL.DeepCopy())
+	standbyWL.Labels[roleLabel] = roleActive
+	if err := r.Patch(ctx, standbyWL, patch); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Switchover done", "newActive", standbyWL.Name)
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 
-func buildWorkloadFromMLJob(job *ai.MLJob, workloadName string) *kueuev1beta1.Workload {
-    // CPU가 비어 있으면 "1"로 기본값 대체
-    cpuStr := job.Spec.CPU
-    if cpuStr == "" {
-        cpuStr = "1"
-    }
-    cpuQty := resource.MustParse(cpuStr)
-
-    return &kueuev1beta1.Workload{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      workloadName,
-            Namespace: job.Namespace,
-        },
-        Spec: kueuev1beta1.WorkloadSpec{
-            QueueName: job.Spec.QueueName,
-            PodSets: []kueuev1beta1.PodSet{{
-                Name:  "train",
-                Count: 1,
-                Template: corev1.PodTemplateSpec{
-                    Spec: corev1.PodSpec{
-                        Containers: []corev1.Container{{
-                            Name:  "trainer",
-                            Image: job.Spec.Image,
-                            Args:  []string{"--resume-from=" + job.Spec.CheckpointPath},
-                            Resources: corev1.ResourceRequirements{
-                                Requests: corev1.ResourceList{
-                                    corev1.ResourceCPU: cpuQty,
-                                },
-                                Limits: corev1.ResourceList{
-                                    corev1.ResourceCPU: cpuQty,
-                                },
-                            },
-                            VolumeMounts: []corev1.VolumeMount{{
-                                Name:      "ckpt",
-                                MountPath: "/mnt/data/checkpoints",
-                            }},
-                        }},
-                        Volumes: []corev1.Volume{{
-                            Name: "ckpt",
-                            VolumeSource: corev1.VolumeSource{
-                                PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-                                    ClaimName: "checkpoint-pvc",
-                                },
-                            },
-                        }},
-                    },
-                },
-            }},
-        },
-    }
-}
+// --------------------------------------------------
 
 func (r *MLJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
-    return ctrl.NewControllerManagedBy(mgr).
-        For(&ai.MLJob{}).
-        Owns(&kueuev1beta1.Workload{}).
-        Owns(&corev1.Pod{}).
-        Complete(r)
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&ai.MLJob{}).
+		Owns(&kueue.Workload{}).
+		Owns(&corev1.Pod{}).
+		Complete(r)
 }
 
 func main() {
-	log.SetLogger(ctrlzap.New(ctrlzap.UseDevMode(true)))
+	ctrl.SetLogger(ctrlzap.New(ctrlzap.UseDevMode(true)))
 
 	scheme := runtime.NewScheme()
-	if err := ai.AddToScheme(scheme); err != nil {
-		panic(err)
-	}
-	if err := kueuev1beta1.AddToScheme(scheme); err != nil {
-		panic(err)
-	}
-	if err := corev1.AddToScheme(scheme); err != nil {
-		panic(err)
-	}
+	_ = ai.AddToScheme(scheme)
+	_ = kueue.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: scheme,
-	})
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme})
 	if err != nil {
 		panic(err)
 	}
-	if err = (&MLJobReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+	reconciler := &MLJobReconciler{
+		Client: mgr.GetClient(),
+		Scheme: scheme,
+		Config: mgr.GetConfig(),
+	}
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		panic(err)
 	}
-	panic(mgr.Start(ctrl.SetupSignalHandler()))
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		panic(err)
+	}
 }
 

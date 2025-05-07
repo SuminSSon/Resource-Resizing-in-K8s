@@ -13,7 +13,7 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get","list","watch","create","delete"]
+    verbs: ["get","list","watch","create","delete","patch"]
 
 # pod-delete-role 정의 (중복 가능)
 ---

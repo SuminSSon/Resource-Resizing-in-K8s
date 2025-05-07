@@ -10,9 +10,11 @@ import (
 type MLJobSpec struct {
 	Image          string `json:"image"`
 	CPU            string `json:"cpu"`
-	GPU	       string `json:"gpu,omitempty"`
-	CheckpointPath string `json:"checkpointPath"`
-	QueueName      string `json:"queueName"`
+//	GPU	       string `json:"gpu,omitempty"`
+
+	CheckpointPVC  string `json:"checkpointPVC,omitempty"`
+	CheckpointPath string `json:"checkpointPath,omitempty"`
+	QueueName      string `json:"queueName,omitempty"`
 }
 
 // +kubebuilder:object:root=true
